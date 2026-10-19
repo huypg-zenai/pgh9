@@ -63,7 +63,7 @@ RENDER SLOT SCALING (pgh8, owner 19/10 ~13:20 VN "keep 80 at 40.8, build pgh8 no
   faster per draft than 40.8), so more cores only buy drafts if the slot count grows with them. With slot_scale 1:
     slots(Q)  = clamp(2 * floor(R_raw(Q) / (2 * cores_per_slot)), slots_base, slots_max),  R_raw = U*kappa*Q - N
     R_sat(Q)  = slots(Q) * cores_per_slot           (replaces render_sat_cores)
-    k_max(Q)  = k_max_base while slots(Q) == slots_base (= the configured renderer), else k_max
+    k_max(Q)  = k_max_base while slots(Q) <= slots_base (= the configured renderer), else k_max
   apply() then sets renderer.sidecar_count = slots / renderer.pool_size and actors.renderer.workers = slots
   (queue_size 2 x slots) BEFORE the renderer starts; at slots_base nothing is touched. Detection failure -> slots_base.
   pgh8 coefficients (refit + slot_scale 1, k_max 96, k_max_base 80): 16/24/32/36/40.8/44/48/54/60/68/>=76 cores ->
@@ -85,6 +85,7 @@ DEFAULT_COEFFS: dict = {
 INT_KEYS = ("k_min", "k_max", "k_fallback", "prompts_per_batch", "slot_scale", "slots_base", "slots_max", "k_max_base")
 CGROUP_ROOT = "/sys/fs/cgroup"
 LAST_DECISION: dict | None = None   # set by apply(); pgh_timeguard reuses its detected cores (CPU read once)
+SLOT_OVERRIDE: int | None = None    # pgh8: set by apply() when the render-slot change failed -> the slots really in place
 V1_DIRS = ("cpu", "cpu,cpuacct", "cpuacct,cpu", ".")
 MODES = ("fixed", "adaptive", "rule", "off")
 DEFAULT_MODE = "fixed"
@@ -250,14 +251,16 @@ def render_slots(cores: float, c: dict) -> int | None:
     """Render slots for `cores` (slot_scale 1), None when slot scaling is off."""
     if not c["slot_scale"]:
         return None
+    if SLOT_OVERRIDE is not None:   # the renderer kept its configured slots (apply() could not raise them)
+        return int(SLOT_OVERRIDE)
     raw = c["usable_frac"] * c["kappa"] * cores - c["non_render_cores"]
     return int(max(c["slots_base"], min(c["slots_max"], 2 * math.floor(raw / (2 * c["cores_per_slot"]) + 1e-9))))
 
 
 def k_ceiling(cores: float, c: dict) -> int:
-    """k_max, or k_max_base while slot scaling keeps the configured slots_base."""
+    """k_max, or k_max_base while slot scaling has no more than slots_base slots (the configured renderer, or fewer)."""
     s = render_slots(cores, c)
-    return c["k_max_base"] if s is not None and s == c["slots_base"] else c["k_max"]
+    return c["k_max_base"] if s is not None and s <= c["slots_base"] else c["k_max"]
 
 
 def render_cores(cores: float, c: dict) -> float:
@@ -306,7 +309,7 @@ def decide(fixed_k: int, env=None, root: str = CGROUP_ROOT, affinity=_affinity, 
     adaptive-fallback | formula | fallback (the last two = mode rule, unchanged from ad93c9f)."""
     env = os.environ if env is None else env
     out = dict(k=int(fixed_k), fixed=int(fixed_k), src="off", mode="off", k40=None, k40_src="", rule_k=None, det=None,
-               coeffs="", coeffs_src="", pred_s=None, reason="", slots=None)
+               coeffs="", coeffs_src="", pred_s=None, reason="", slots=None, co=None)
     if fixed_k <= 1:                                   # single-pass config: nothing to adapt
         out["src"] = "single"
         return out
@@ -322,7 +325,7 @@ def decide(fixed_k: int, env=None, root: str = CGROUP_ROOT, affinity=_affinity, 
             co, out["coeffs_src"] = normalize_coeffs(raw), "env"
         except (ValueError, TypeError) as exc:
             notes.append(f"coeffs-error ({type(exc).__name__}: {exc}) -> default coefficients")
-    out["coeffs"] = _coeffs_text(co)
+    out["coeffs"], out["co"] = _coeffs_text(co), co
     k40, out["k40_src"], n40 = read_k40(env)
     out["k40"] = k40
     if mode in ("fixed", "adaptive"):
@@ -382,32 +385,62 @@ def describe(d: dict) -> str:
 
 def set_render_slots(settings, slots: int, d: dict) -> None:
     """pgh8: renderer.sidecar_count = slots / pool_size, actors.renderer workers = slots, queue 2 x slots, when slots
-    exceed the configured slot count; never fewer than configured. Any problem -> '!!' note, renderer left as configured."""
+    exceed the configured slot count; never fewer than configured. Returns True when the slots are in place. Any
+    problem -> '!!' note, renderer restored to its configured values, False (apply() then re-sizes K for those slots)."""
+    rc = ra = old = None
     try:
         rc, ra = settings.renderer, settings.actors.renderer
+        old = (rc.sidecar_count, ra.workers, ra.queue_size)
         pool, have = int(rc.pool_size), int(rc.sidecar_count) * int(rc.pool_size)
         if slots <= have:
             d["slots"] = have
-            return
+            return True
         if pool < 1 or slots % pool:
             raise ValueError(f"{slots} slots not a multiple of pool_size {pool}")
         n = slots // pool
         if n > 16:   # sidecar ports sidecar_port + 0..15 = 8003..8018 (8020 = embedder)
             raise ValueError(f"{n} sidecars > 16")
-        rc.sidecar_count, ra.workers, ra.queue_size = n, slots, max(int(ra.queue_size), 2 * slots)
+        rc.sidecar_count = n
+        ra.workers = slots
+        ra.queue_size = max(int(ra.queue_size), 2 * slots)
+        return True
     except Exception as exc:  # noqa: BLE001 - the renderer must still start as configured
-        d["reason"] = (d.get("reason") + "; " if d.get("reason") else "") + f"!! render slots not changed: {exc!r}"
+        restored = ""
+        if old is not None:   # undo a half-applied change (review 19/10 issue 3)
+            try:
+                rc.sidecar_count, ra.workers, ra.queue_size = old
+            except Exception as exc2:  # noqa: BLE001
+                restored = f" (restore failed: {exc2!r})"
+        d["reason"] = (d.get("reason") + "; " if d.get("reason") else "") + f"!! render slots not changed: {exc!r}{restored}"
         d["slots"] = None
+        return False
 
 
 def apply(settings, diag: dict | None = None, env=None, root: str = CGROUP_ROOT, affinity=_affinity,
           cpu_count=os.cpu_count, log=print) -> dict:
     """Start-up hook: set settings.actors.coder.ensemble_size, record k for the miner-diag header, log one line."""
     coder = settings.actors.coder
+    global SLOT_OVERRIDE
+    SLOT_OVERRIDE = None
     d = decide(int(coder.ensemble_size), env=env, root=root, affinity=affinity, cpu_count=cpu_count)
+    if d.get("slots") is not None and not set_render_slots(settings, int(d["slots"]), d):
+        # review 19/10 issue 1: the renderer kept its configured slots -> K and the model (also the time guard's) for those
+        co, cores = d["co"], d["det"]["cores"]
+        try:
+            rc = settings.renderer
+            SLOT_OVERRIDE = int(rc.sidecar_count) * int(rc.pool_size)
+        except Exception:  # noqa: BLE001
+            SLOT_OVERRIDE = int(co["slots_base"])
+        if d["src"] in ("formula", "adaptive-rule", "adaptive-floor"):
+            rk = formula_k(cores, co)
+            k = max(d["k40"], rk) if d["mode"] == "adaptive" else rk
+            if k < d["k"]:
+                d["reason"] += f"; K {d['k']} -> {k} for the {SLOT_OVERRIDE} render slots in place"
+                d["k"] = k
+            if d["rule_k"] is not None:
+                d["rule_k"] = rk
+        d["pred_s"] = predicted_round_s(d["k"], cores, co)
     coder.ensemble_size = int(d["k"])
-    if d.get("slots") is not None:
-        set_render_slots(settings, int(d["slots"]), d)
     global LAST_DECISION
     LAST_DECISION = d
     if diag is not None:
